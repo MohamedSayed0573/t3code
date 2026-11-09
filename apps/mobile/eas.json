@@ -62,6 +62,10 @@
         "T3CODE_MOBILE_VERSION": "3.0.0"
       }
     },
+    "android-store-check": {
+      "extends": "production",
+      "autoIncrement": false
+    },
     "production": {
       "corepack": true,
       "env": {

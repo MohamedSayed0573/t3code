@@ -1,0 +1,162 @@
+name: Mobile Android Store Build Check
+
+# TEMPORARY (drop before merge): runs the Android store build job from
+# mobile-eas-production.yml on this PR with a non-incrementing profile and no
+# submission, to measure cold/warm times on a separate sticky disk.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mobile-android-store-build-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android store build
+    if: github.repository == 'pingdotgg/t3code'
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 60
+    concurrency:
+      group: mobile-android-store-build-check
+      cancel-in-progress: false
+    permissions:
+      contents: write # pushes the build record tag
+    env:
+      APP_VARIANT: production
+      NODE_OPTIONS: --max-old-space-size=8192
+      EXPO_TOKEN: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+      BUILD_TAG: mobile-android-build-check/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # A queued run can follow a build of the same fingerprint; manual runs always build.
+      - id: record
+        name: Check build record
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$FORCE" != "true" ] && [ -n "$(git tag -l "$BUILD_TAG")" ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo ":white_check_mark: android: \`$BUILD_TAG\` was built by an earlier run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Prepare build directories
+        if: steps.record.outputs.built != 'true'
+        run: |
+          cache="$HOME/.cache/t3-android-store"
+          {
+            echo "GRADLE_USER_HOME=$cache/gradle"
+            echo "CCACHE_DIR=$cache/ccache"
+            echo "CCACHE_MAXSIZE=5G"
+            echo "pnpm_config_store_dir=$cache/pnpm-store"
+            # eas build --local copies the project here. A fixed path keeps
+            # ccache keys stable, and the same disk as the store lets pnpm hardlink.
+            echo "EAS_LOCAL_BUILD_WORKINGDIR=$cache/eas-build"
+            echo "CCACHE_BASEDIR=$cache/eas-build"
+            # CMake (3.17+) reads these, and AGP passes Gradle's environment through.
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          } >> "$GITHUB_ENV"
+
+      - name: Mount build cache
+        if: steps.record.outputs.built != 'true'
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-android-store-build-check
+          path: ~/.cache/t3-android-store
+
+      - name: Configure Gradle and ccache
+        if: steps.record.outputs.built != 'true'
+        run: |
+          mkdir -p "$GRADLE_USER_HOME" "$CCACHE_DIR"
+          rm -rf "$EAS_LOCAL_BUILD_WORKINGDIR"
+          # No daemon: nothing should hold the sticky disk open when it is committed.
+          printf 'org.gradle.caching=true\norg.gradle.daemon=false\n' > "$GRADLE_USER_HOME/gradle.properties"
+          sudo sed -i 's|http://|https://|g' /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update -qq && sudo apt-get install -y -qq ccache
+          ccache --zero-stats
+
+      # eas build --local installs the workspace itself, so no repo install here.
+      - name: Setup Node
+        if: steps.record.outputs.built != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: Enable corepack
+        if: steps.record.outputs.built != 'true'
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+          pnpm --version
+
+      - name: Setup Java
+        if: steps.record.outputs.built != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup EAS
+        if: steps.record.outputs.built != 'true'
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+          packager: npm
+
+      - name: Pull production environment variables
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: |
+          eas env:pull production --non-interactive
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from "node:fs";
+          import { parseEnv } from "node:util";
+          const env = parseEnv(readFileSync(".env.local", "utf8"));
+          const googleServicesFile = env.T3CODE_ANDROID_GOOGLE_SERVICES_FILE;
+          if (!googleServicesFile) {
+            throw new Error("T3CODE_ANDROID_GOOGLE_SERVICES_FILE is missing from the production environment");
+          }
+          appendFileSync(process.env.GITHUB_ENV, `T3CODE_ANDROID_GOOGLE_SERVICES_FILE=${googleServicesFile}\n`);
+          NODE
+
+      - name: Build
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: |
+          start=$(date +%s)
+          eas build --local --platform android --profile android-store-check --non-interactive --output "$RUNNER_TEMP/t3code.aab"
+          abis="$(unzip -Z1 "$RUNNER_TEMP/t3code.aab" | sed -n 's|^base/lib/\([^/]*\)/.*|\1|p' | sort -u | paste -sd, -)"
+          {
+            echo "### Android $BUILD_TAG: build step $(( $(date +%s) - start ))s"
+            echo "- ABIs: \`$abis\`"
+            echo '```'
+            ccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$abis" != "arm64-v8a,armeabi-v7a" ]; then
+            echo "::error::Expected only ARM native libraries in the AAB, found $abis"
+            exit 1
+          fi
+
+      - name: Submit to Google Play (skipped in check)
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: echo eas submit --platform android --profile production --path "$RUNNER_TEMP/t3code.aab" --non-interactive
+
+      - name: Record build
+        if: steps.record.outputs.built != 'true'
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$BUILD_TAG" >/dev/null; then
+            echo "$BUILD_TAG already exists."
+          else
+            git tag "$BUILD_TAG" HEAD
+            git push origin "refs/tags/$BUILD_TAG"
+          fi
+          echo ":rocket: android: submitted and recorded \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          git push origin --delete "refs/tags/$BUILD_TAG"
