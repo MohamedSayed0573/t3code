@@ -1,0 +1,138 @@
+name: Mobile iOS Store Build Check
+
+# TEMPORARY (drop before merge): runs the iOS store build job from
+# mobile-eas-production.yml on this PR with a non-incrementing profile and no
+# submission.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mobile-ios-store-build-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: iOS store build
+    if: github.repository == 'pingdotgg/t3code'
+    runs-on: blacksmith-12vcpu-macos-27
+    timeout-minutes: 60
+    concurrency:
+      group: mobile-ios-store-build-check
+      cancel-in-progress: false
+    permissions:
+      contents: write # pushes the build record tag
+    env:
+      APP_VARIANT: production
+      NODE_OPTIONS: --max-old-space-size=8192
+      EXPO_TOKEN: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+      PROFILE: ios-store-check
+      BUILD_TAG: mobile-ios-build-check/${{ github.run_id }}-${{ github.run_attempt }}
+      ALLOW_XCODE_RC: true # the image has only the 27.1 RC today
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # A queued run can follow a build of the same fingerprint; manual runs always build.
+      - id: record
+        name: Check build record
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$FORCE" != "true" ] && [ -n "$(git tag -l "$BUILD_TAG")" ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo ":white_check_mark: ios: \`$BUILD_TAG\` was built by an earlier run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Select Xcode 27.1
+        if: steps.record.outputs.built != 'true'
+        run: |
+          xcode=/Applications/Xcode_27.1.app
+          if [ ! -d "$xcode" ] && [ "$ALLOW_XCODE_RC" = "true" ]; then
+            xcode=/Applications/Xcode_27.1_Release_Candidate.app
+          fi
+          if [ ! -d "$xcode" ]; then
+            ls -d /Applications/Xcode*.app
+            echo "::error::Xcode 27.1 (final) is not on this runner. Set the MOBILE_IOS_ALLOW_XCODE_RC repository variable to true to build store binaries with the release candidate."
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          xcodebuild -version
+          echo "- Xcode: \`$(basename "$xcode")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # EAS's credentials step fails to import the distribution certificate without it.
+      - name: Install Apple WWDR G3 intermediate
+        if: steps.record.outputs.built != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/AppleWWDRCAG3.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          sudo security add-certificates -k /Library/Keychains/System.keychain "$RUNNER_TEMP/AppleWWDRCAG3.cer" || true
+          security find-certificate -c "Apple Worldwide Developer Relations" /Library/Keychains/System.keychain | grep -m1 labl
+
+      - name: Setup Node
+        if: steps.record.outputs.built != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: Enable corepack
+        if: steps.record.outputs.built != 'true'
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+          pnpm --version
+
+      # EAS commands load app.config.ts, whose plugins must resolve. Keep install
+      # scripts: some download native assets that the build's fingerprint check hashes.
+      - name: Install mobile dependencies
+        if: steps.record.outputs.built != 'true'
+        run: pnpm install --frozen-lockfile --prefer-offline --filter=@t3tools/mobile...
+
+      - name: Setup EAS
+        if: steps.record.outputs.built != 'true'
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+          packager: npm
+
+      - name: Build tools
+        if: steps.record.outputs.built != 'true'
+        run: |
+          command -v pod || sudo gem install cocoapods --no-document
+          command -v fastlane || brew install fastlane
+          pod --version
+          fastlane --version | tail -1
+
+      - name: Pull production environment variables
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: eas env:pull production --non-interactive
+
+      - name: Build
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: |
+          # A real path: /var -> /private/var symlinks break the expo-widgets bundle step.
+          export EAS_LOCAL_BUILD_WORKINGDIR="$RUNNER_TEMP/eas-build"
+          start=$(date +%s)
+          eas build --local --platform ios --profile "$PROFILE" --non-interactive --output "$RUNNER_TEMP/t3code.ipa"
+          echo "### iOS build step $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Submit to App Store Connect (skipped in check)
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: echo eas submit --platform ios --profile "$PROFILE" --path "$RUNNER_TEMP/t3code.ipa" --non-interactive
+
+      - name: Record build
+        if: steps.record.outputs.built != 'true'
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$BUILD_TAG" >/dev/null; then
+            echo "$BUILD_TAG already exists."
+          else
+            git tag "$BUILD_TAG" HEAD
+            git push origin "refs/tags/$BUILD_TAG"
+          fi
+          echo ":rocket: ios: submitted and recorded \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          git push origin --delete "refs/tags/$BUILD_TAG"

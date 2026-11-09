@@ -66,6 +66,10 @@
       "extends": "production",
       "autoIncrement": false
     },
+    "ios-store-check": {
+      "extends": "production",
+      "autoIncrement": false
+    },
     "production": {
       "corepack": true,
       "env": {
