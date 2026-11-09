@@ -93,11 +93,11 @@ jobs:
           corepack enable
           pnpm --version
 
-      # EAS commands load app.config.ts, whose plugins must resolve. The build
-      # installs the workspace again in its own copy, so skip scripts here.
+      # EAS commands load app.config.ts, whose plugins must resolve. Keep install
+      # scripts: some download native assets that the build's fingerprint check hashes.
       - name: Install mobile dependencies
         if: steps.record.outputs.built != 'true'
-        run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --filter=@t3tools/mobile...
+        run: pnpm install --frozen-lockfile --prefer-offline --filter=@t3tools/mobile...
 
       - name: Setup Java
         if: steps.record.outputs.built != 'true'
