@@ -136,6 +136,7 @@ jobs:
         run: |
           start=$(date +%s)
           eas build --local --platform android --profile android-store-check --non-interactive --output "$RUNNER_TEMP/t3code.aab"
+          ccache --show-stats
           abis="$(unzip -Z1 "$RUNNER_TEMP/t3code.aab" | sed -n 's|^base/lib/\([^/]*\)/.*|\1|p' | sort -u | paste -sd, -)"
           {
             echo "### Android $BUILD_TAG: build step $(( $(date +%s) - start ))s"
@@ -144,6 +145,7 @@ jobs:
             ccache --show-stats
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "ABIs: $abis"
           if [ "$abis" != "arm64-v8a,armeabi-v7a" ]; then
             echo "::error::Expected only ARM native libraries in the AAB, found $abis"
             exit 1
@@ -154,14 +156,14 @@ jobs:
         working-directory: apps/mobile
         run: echo eas submit --platform android --profile production --path "$RUNNER_TEMP/t3code.aab" --non-interactive
 
+      # Production tags main commits; check GITHUB_TOKEN may tag those (the PR head is refused).
       - name: Record build
         if: steps.record.outputs.built != 'true'
         run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/$BUILD_TAG" >/dev/null; then
-            echo "$BUILD_TAG already exists."
-          else
-            git tag "$BUILD_TAG" HEAD
-            git push origin "refs/tags/$BUILD_TAG"
-          fi
-          echo ":rocket: android: submitted and recorded \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          git push origin --delete "refs/tags/$BUILD_TAG"
+          git fetch -q origin main
+          for sha in "$(git rev-parse origin/main)" "$(git log -1 --format=%H origin/main -- .github/workflows)"; do
+            tag="$BUILD_TAG-$sha"
+            git tag "$tag" "$sha"
+            git push origin "refs/tags/$tag"
+            git push origin --delete "refs/tags/$tag"
+          done
