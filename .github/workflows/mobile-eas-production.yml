@@ -7,6 +7,10 @@ name: Mobile EAS Production
 # runner, with corepack pinning pnpm 10.24 in eas.json, local == build.
 #
 # Every merge reconciles native fingerprints and publishes matching OTAs.
+# Android store builds run here with `eas build --local` on Blacksmith (the
+# android job); iOS builds run on EAS. Local builds never appear in
+# `eas build:list`, so each finished Android build pushes a
+# mobile-android-build/<version>/<fingerprint> tag that the reconcile reads.
 # iOS prereleases use the testflight profile (3.0.0); App Store binaries use
 # production and the committed app version, built manually. Both receive OTAs
 # for their own major version. Android continues using production automatically.
@@ -65,20 +69,24 @@ on:
       - pnpm-workspace.yaml
       - .github/workflows/mobile-eas-production.yml
 
-# Serialize runs so OTAs publish in merge order. GitHub keeps at most one
-# queued run per group, so a burst of merges collapses into one run of the
-# newest commit — intermediate commits don't need their own OTA.
-concurrency:
-  group: mobile-eas-production
-  cancel-in-progress: false
-
 jobs:
   production:
     name: EAS ${{ inputs.profile || 'production' }} ${{ github.event_name == 'push' && 'auto' || inputs.mode }}
     if: github.repository == 'pingdotgg/t3code'
     runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Serialize runs so OTAs publish in merge order. GitHub keeps at most one
+    # queued job per group, so a burst of merges collapses into one run of the
+    # newest commit — intermediate commits don't need their own OTA.
+    concurrency:
+      group: mobile-eas-production
+      cancel-in-progress: false
     permissions:
       contents: read
+    outputs:
+      android_build: ${{ steps.reconcile.outputs.android_build || steps.android_manual.outputs.android_build }}
+      android_fingerprint: ${{ steps.reconcile.outputs.android_fingerprint || steps.android_manual.outputs.android_fingerprint }}
+      android_version: ${{ steps.reconcile.outputs.android_version || steps.android_manual.outputs.android_version }}
+      android_sha: ${{ steps.reconcile.outputs.android_sha || steps.android_manual.outputs.android_sha }}
     env:
       APP_VARIANT: production
       NODE_OPTIONS: --max-old-space-size=8192
@@ -240,13 +248,29 @@ jobs:
             echo "> Apple closes an iOS release train after App Store approval. Before building iOS, confirm \`$version\` is newer than the approved App Store version."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build and submit (manual)
-        if: steps.expo-token.outputs.present == 'true' && github.event_name == 'workflow_dispatch' && inputs.mode == 'build'
+      - name: Build and submit iOS (manual)
+        if: steps.expo-token.outputs.present == 'true' && github.event_name == 'workflow_dispatch' && inputs.mode == 'build' && inputs.platform != 'android'
         working-directory: apps/mobile
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
           MOBILE_BUILD_PROFILE: ${{ inputs.profile || 'production' }}
-        run: eas build --platform ${{ inputs.platform }} --profile "$MOBILE_BUILD_PROFILE" --auto-submit --non-interactive --no-wait
+        run: eas build --platform ios --profile "$MOBILE_BUILD_PROFILE" --auto-submit --non-interactive --no-wait
+
+      - id: android_manual
+        name: Queue Android build (manual)
+        if: steps.expo-token.outputs.present == 'true' && github.event_name == 'workflow_dispatch' && inputs.mode == 'build' && inputs.platform != 'ios'
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+        run: |
+          version="$(npx expo config --json --type public | jq -r '.version')"
+          hash="$(eas fingerprint:generate --platform android --environment production --json --non-interactive | sed -n '/^{/,$p' | jq -er '.hash | select(type == "string" and length > 0)')"
+          {
+            echo "android_build=true"
+            echo "android_fingerprint=$hash"
+            echo "android_version=$version"
+            echo "android_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       # @expo/fingerprint swallows autolinking errors and returns no Expo module
       # sources, so native changes stop moving the hash and OTAs reach binaries
@@ -320,6 +344,16 @@ jobs:
             active="$(jq '[.[] | select(.status == "NEW" or .status == "IN_QUEUE" or .status == "IN_PROGRESS")] | length' <<<"$matches")"
             errored="$(jq '[.[] | select(.status == "ERRORED")] | length' <<<"$matches")"
             latest_version="$(eas build:list --platform "$platform" --build-profile "$profile" --limit 1 --json --non-interactive | jq -r '.[0].appVersion // "none"')"
+            # Android builds locally in the android job and records each build
+            # as a tag; EAS records still count for builds made before that.
+            if [ "$platform" = "android" ]; then
+              if [ -n "$(git tag -l "mobile-android-build/*/$hash")" ]; then
+                finished=$((finished + 1))
+              fi
+              if [ -n "$(git tag -l "mobile-android-build/$version/*")" ]; then
+                latest_version="$version"
+              fi
+            fi
 
             if [ "$finished" -gt 0 ]; then
               if eas update \
@@ -363,6 +397,16 @@ jobs:
             fi
 
             echo "$platform: $reason — building"
+            if [ "$platform" = "android" ]; then
+              {
+                echo "android_build=true"
+                echo "android_fingerprint=$hash"
+                echo "android_version=$version"
+                echo "android_sha=$(git rev-parse HEAD)"
+              } >> "$GITHUB_OUTPUT"
+              echo ":building_construction: android: building and submitting $version in the Android store build job ($reason)" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             if eas build --platform "$platform" --profile "$profile" --auto-submit --non-interactive --no-wait; then
               echo ":building_construction: $platform: scheduled production build and submission for $version ($reason)" >> "$GITHUB_STEP_SUMMARY"
             else
@@ -386,3 +430,156 @@ jobs:
               node scripts/upload-sourcemaps.mts ota "$dir"
             fi
           done
+
+  # `eas build --local` on Blacksmith, ARM-only, without release lint (see the
+  # production profile in eas.json), with Gradle, ccache, and pnpm state on a
+  # sticky disk. Its own concurrency group keeps later OTAs from waiting on it.
+  android:
+    name: Android store build
+    needs: production
+    # Still build when an unrelated OTA in the production job failed.
+    if: ${{ !cancelled() && needs.production.outputs.android_build == 'true' }}
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 60
+    concurrency:
+      group: mobile-android-store-build
+      cancel-in-progress: false
+    permissions:
+      contents: write # pushes the build record tag
+    env:
+      APP_VARIANT: production
+      NODE_OPTIONS: --max-old-space-size=8192
+      EXPO_TOKEN: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+      BUILD_TAG: mobile-android-build/${{ needs.production.outputs.android_version }}/${{ needs.production.outputs.android_fingerprint }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.production.outputs.android_sha }}
+          fetch-depth: 0
+
+      # A queued run can follow a build of the same fingerprint; manual runs always build.
+      - id: record
+        name: Check build record
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$FORCE" != "true" ] && [ -n "$(git tag -l "$BUILD_TAG")" ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo ":white_check_mark: android: \`$BUILD_TAG\` was built by an earlier run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Prepare build directories
+        if: steps.record.outputs.built != 'true'
+        run: |
+          cache="$HOME/.cache/t3-android-store"
+          {
+            echo "GRADLE_USER_HOME=$cache/gradle"
+            echo "CCACHE_DIR=$cache/ccache"
+            echo "CCACHE_MAXSIZE=5G"
+            echo "pnpm_config_store_dir=$cache/pnpm-store"
+            # eas build --local copies the project here. A fixed path keeps
+            # ccache keys stable, and the same disk as the store lets pnpm hardlink.
+            echo "EAS_LOCAL_BUILD_WORKINGDIR=$cache/eas-build"
+            echo "CCACHE_BASEDIR=$cache/eas-build"
+            # CMake (3.17+) reads these, and AGP passes Gradle's environment through.
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          } >> "$GITHUB_ENV"
+
+      - name: Mount build cache
+        if: steps.record.outputs.built != 'true'
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-android-store-build
+          path: ~/.cache/t3-android-store
+
+      - name: Configure Gradle and ccache
+        if: steps.record.outputs.built != 'true'
+        run: |
+          mkdir -p "$GRADLE_USER_HOME" "$CCACHE_DIR"
+          rm -rf "$EAS_LOCAL_BUILD_WORKINGDIR"
+          # No daemon: nothing should hold the sticky disk open when it is committed.
+          printf 'org.gradle.caching=true\norg.gradle.daemon=false\n' > "$GRADLE_USER_HOME/gradle.properties"
+          sudo sed -i 's|http://|https://|g' /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update -qq && sudo apt-get install -y -qq ccache
+          ccache --zero-stats
+
+      # eas build --local installs the workspace itself, so no repo install here.
+      - name: Setup Node
+        if: steps.record.outputs.built != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: Enable corepack
+        if: steps.record.outputs.built != 'true'
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+          pnpm --version
+
+      - name: Setup Java
+        if: steps.record.outputs.built != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup EAS
+        if: steps.record.outputs.built != 'true'
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_PRODUCTION_TOKEN }}
+          packager: npm
+
+      - name: Pull production environment variables
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: |
+          eas env:pull production --non-interactive
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from "node:fs";
+          import { parseEnv } from "node:util";
+          const env = parseEnv(readFileSync(".env.local", "utf8"));
+          const googleServicesFile = env.T3CODE_ANDROID_GOOGLE_SERVICES_FILE;
+          if (!googleServicesFile) {
+            throw new Error("T3CODE_ANDROID_GOOGLE_SERVICES_FILE is missing from the production environment");
+          }
+          appendFileSync(process.env.GITHUB_ENV, `T3CODE_ANDROID_GOOGLE_SERVICES_FILE=${googleServicesFile}\n`);
+          NODE
+
+      - name: Build
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: |
+          eas build --local --platform android --profile production --non-interactive --output "$RUNNER_TEMP/t3code.aab"
+          abis="$(unzip -Z1 "$RUNNER_TEMP/t3code.aab" | sed -n 's|^base/lib/\([^/]*\)/.*|\1|p' | sort -u | paste -sd, -)"
+          {
+            echo "### Android $BUILD_TAG"
+            echo "- ABIs: \`$abis\`"
+            echo '```'
+            ccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$abis" != "arm64-v8a,armeabi-v7a" ]; then
+            echo "::error::Expected only ARM native libraries in the AAB, found $abis"
+            exit 1
+          fi
+
+      - name: Submit to Google Play
+        if: steps.record.outputs.built != 'true'
+        working-directory: apps/mobile
+        run: eas submit --platform android --profile production --path "$RUNNER_TEMP/t3code.aab" --non-interactive
+
+      - name: Record build
+        if: steps.record.outputs.built != 'true'
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$BUILD_TAG" >/dev/null; then
+            echo "$BUILD_TAG already exists."
+          else
+            git tag "$BUILD_TAG" HEAD
+            git push origin "refs/tags/$BUILD_TAG"
+          fi
+          echo ":rocket: android: submitted and recorded \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"
