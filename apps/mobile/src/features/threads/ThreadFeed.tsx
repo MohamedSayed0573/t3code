@@ -143,7 +143,15 @@ import { ThreadInlineFilePreview } from "./ThreadInlineFilePreview";
 import { flattenThemeColor } from "../../lib/mobileTheme";
 import { PresentationSource } from "../../components/ui/NativePresentation";
 import { NativeScrollViewMarker } from "../../native/NativeScrollViewMarker";
-import Animated, { FadeIn, FadeInDown, type SharedValue } from "react-native-reanimated";
+import Animated, {
+  FadeIn,
+  FadeInDown,
+  useAnimatedStyle,
+  useSharedValue,
+  withSequence,
+  withTiming,
+  type SharedValue,
+} from "react-native-reanimated";
 import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { FONT_FAMILIES } from "../../lib/fontFamilies";
 import { scopedThreadKey } from "../../lib/scopedEntities";
@@ -3291,6 +3299,22 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Jumping to a different message whose row index is unchanged must still land the jump.
   }, [jumpToMessageId, jumpIndex]);
 
+  // A new split width re-wraps every row in one commit, and the list keeps its end, so everything on
+  // screen jumps by the change in height above the top row. The list starts offset by that jump,
+  // which keeps the top row where it was, and glides back.
+  const reflowShift = useSharedValue(0);
+  const reflowShiftStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: reflowShift.value }],
+  }));
+  const easeEndHoldShift =
+    splitLayout && !reduceMotion
+      ? (shift: number) => {
+          reflowShift.set(
+            withSequence(withTiming(-shift, { duration: 0 }), withTiming(0, { duration: 280 })),
+          );
+        }
+      : undefined;
+
   const handleViewportLayout = (event: LayoutChangeEvent) => {
     const nextWidth = Math.round(event.nativeEvent.layout.width);
     const nextHeight = Math.round(event.nativeEvent.layout.height);
@@ -3653,9 +3677,12 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         {/* In a split, rows only re-wrap in the render that hands the list its new width. A native
             column resize would re-wrap them first, and the list would place the taller or shorter
             rows at their old offsets until their measurements came back. */}
-        <View
-          className="flex-1"
-          style={splitLayout && viewportWidth > 0 ? { width: viewportWidth } : undefined}
+        <Animated.View
+          style={[
+            { flex: 1 },
+            splitLayout && viewportWidth > 0 ? { width: viewportWidth } : null,
+            reflowShiftStyle,
+          ]}
         >
           {/* oxlint-disable-next-line t3code/require-registered-list-scroll -- ThreadFeedScrollView is passed through the iOS-only spread below; the prop rejects undefined. */}
           <KeyboardAwareLegendList
@@ -3675,6 +3702,9 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             freeze={props.freeze}
             maintainScrollAtEnd={jumpReady ? false : THREAD_FEED_MAINTAIN_SCROLL_AT_END}
             maintainVisibleContentPosition
+            {...(easeEndHoldShift
+              ? { onEndHoldShift: easeEndHoldShift, sizeChangeKey: viewportWidth }
+              : {})}
             data={groupedFeed}
             extraData={listAppearanceData}
             renderItem={renderItem}
@@ -3744,7 +3774,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
               paddingRight: contentHorizontalPadding + contentRightInset,
             }}
           />
-        </View>
+        </Animated.View>
         {presentedFeed.length === 0 &&
         !props.worktreeSetup &&
         props.activeWorkStartedAt === null &&

@@ -1,8 +1,44 @@
+diff --git a/animated.d.ts b/animated.d.ts
+index c519061902a1fc47c7722a1ed2e6d9c3e971bfaa..f4f94bd09203ec6dc6bc9b2e6fd789ee72469b97 100644
+--- a/animated.d.ts
++++ b/animated.d.ts
+@@ -282,6 +282,13 @@ interface LegendListSpecificProps<ItemT, TItemType extends string | undefined> {
+      * @default false
+      */
+     maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
++    /**
++     * T3 patch: called when a size change held the end and moved the top visible row on screen by
++     * `shift` points (down is positive). Native only.
++     */
++    onEndHoldShift?: (shift: number) => void;
++    /** T3 patch: a change marks a reflow, such as a new width, for `onEndHoldShift`. */
++    sizeChangeKey?: string | number;
+     /**
+      * Distance threshold in percentage of screen size to trigger maintainScrollAtEnd.
+      * @default 0.1
+diff --git a/react-native.d.ts b/react-native.d.ts
+index 983e937cf5c19134e949e0b2f609ba21541b77af..124bdd5243678a4d65f024841261861dd96d83f2 100644
+--- a/react-native.d.ts
++++ b/react-native.d.ts
+@@ -282,6 +282,13 @@ interface LegendListSpecificProps<ItemT, TItemType extends string | undefined> {
+      * @default false
+      */
+     maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
++    /**
++     * T3 patch: called when a size change held the end and moved the top visible row on screen by
++     * `shift` points (down is positive). Native only.
++     */
++    onEndHoldShift?: (shift: number) => void;
++    /** T3 patch: a change marks a reflow, such as a new width, for `onEndHoldShift`. */
++    sizeChangeKey?: string | number;
+     /**
+      * Distance threshold in percentage of screen size to trigger maintainScrollAtEnd.
+      * @default 0.1
 diff --git a/react-native.js b/react-native.js
-index 4af685dfb961eb0c8a4bf1ae9132c9304cf4fa4d..df4ead7ae4f03cd0fbcd99a3df7d95e15b1852b1 100644
+index 4af685dfb961eb0c8a4bf1ae9132c9304cf4fa4d..901dd035eafc3846e390dc006215a2977933ae5c 100644
 --- a/react-native.js
 +++ b/react-native.js
-@@ -1795,7 +1795,35 @@ function resolvePendingNativeMVCPAdjust(ctx, newScroll) {
+@@ -1795,7 +1795,51 @@ function resolvePendingNativeMVCPAdjust(ctx, newScroll) {
    }
    return false;
  }
@@ -18,11 +54,16 @@ index 4af685dfb961eb0c8a4bf1ae9132c9304cf4fa4d..df4ead7ae4f03cd0fbcd99a3df7d95e1
 +  if (!shouldHoldEndOnSizeChange(ctx, dataChanged)) {
 +    return restore;
 +  }
++  const { idsInView, indexByKey, positions } = ctx.state;
++  const anchorId = idsInView.find((id) => indexByKey.get(id) !== void 0);
++  const anchorIndex = anchorId === void 0 ? void 0 : indexByKey.get(anchorId);
++  const anchorPosition = anchorIndex === void 0 ? void 0 : positions[anchorIndex];
 +  return () => {
 +    if (!shouldHoldEndOnSizeChange(ctx, dataChanged)) {
 +      restore == null ? void 0 : restore();
 +      return;
 +    }
++    const scrollBefore = ctx.state.scroll;
 +    // Content that shrinks under an offset past its new end pulls the native offset back by itself.
 +    const endOffset = getScrollRangeEnd(ctx);
 +    if (ctx.state.scroll > endOffset) {
@@ -32,17 +73,50 @@ index 4af685dfb961eb0c8a4bf1ae9132c9304cf4fa4d..df4ead7ae4f03cd0fbcd99a3df7d95e1
 +    if (Math.abs(positionDiff) > MVCP_POSITION_EPSILON) {
 +      requestAdjust(ctx, positionDiff, adjustmentSource);
 +    }
++    // T3 patch: how far holding the end moved the top visible row on screen, for a caller that
++    // eases the jump. Reported only shortly after `sizeChangeKey` changes, so growth at the end
++    // while streaming still follows at once.
++    const onEndHoldShift = ctx.state.props.onEndHoldShift;
++    const newAnchorIndex = anchorId === void 0 ? void 0 : ctx.state.indexByKey.get(anchorId);
++    const newAnchorPosition = newAnchorIndex === void 0 ? void 0 : ctx.state.positions[newAnchorIndex];
++    const inReflow = ctx.state.endHoldReflowUntil !== void 0 && Date.now() < ctx.state.endHoldReflowUntil;
++    if (onEndHoldShift && inReflow && anchorPosition !== void 0 && newAnchorPosition !== void 0) {
++      const shift = newAnchorPosition - anchorPosition - (ctx.state.scroll - scrollBefore);
++      if (Math.abs(shift) > MVCP_POSITION_EPSILON) onEndHoldShift(shift);
++    }
 +  };
 +}
 +function prepareDefaultMVCP(ctx, dataChanged, adjustmentSource) {
    var _a3, _b, _c;
    const state = ctx.state;
    const { idsInView, positions, props } = state;
+@@ -8366,6 +8410,8 @@ var LegendListInner = typedForwardRef(function LegendListInner2(props, forwarded
+     ListHeaderComponent,
+     maintainScrollAtEnd = false,
+     maintainScrollAtEndThreshold = 0.1,
++    onEndHoldShift,
++    sizeChangeKey,
+     maintainVisibleContentPosition: maintainVisibleContentPositionProp,
+     numColumns: numColumnsProp = 1,
+     overrideItemLayout,
+@@ -8625,7 +8671,12 @@ var LegendListInner = typedForwardRef(function LegendListInner2(props, forwarded
+   const throttledOnScroll = useThrottledOnScroll(onScrollProp != null ? onScrollProp : noopOnScroll, scrollEventThrottle != null ? scrollEventThrottle : 0);
+   const throttleScrollFn = scrollEventThrottle && onScrollProp ? throttledOnScroll : onScrollProp;
+   const didAnchoredEndSpaceAnchorIndexChange = !isFirstLocal && !didDataChangeLocal && ((_r = state.props.anchoredEndSpace) == null ? void 0 : _r.anchorIndex) !== (anchoredEndSpace == null ? void 0 : anchoredEndSpace.anchorIndex);
++  if (state.props.sizeChangeKey !== void 0 && sizeChangeKey !== state.props.sizeChangeKey) {
++    state.endHoldReflowUntil = Date.now() + 500;
++  }
+   state.props = {
++    onEndHoldShift,
++    sizeChangeKey,
+     adaptiveRender: experimental_adaptiveRender,
+     alignItemsAtEnd,
+     alignItemsAtEndPaddingEnabled: useAlignItemsAtEndPadding,
 diff --git a/react-native.mjs b/react-native.mjs
-index 9ebfddc183a9b202d35c990a387c9b628feeb185..c414a49e866ecab1393645101fb67d55530a7d00 100644
+index 9ebfddc183a9b202d35c990a387c9b628feeb185..cf3433ee2f84c8d923bf1200bb1ff1b640f557d4 100644
 --- a/react-native.mjs
 +++ b/react-native.mjs
-@@ -1774,7 +1774,35 @@ function resolvePendingNativeMVCPAdjust(ctx, newScroll) {
+@@ -1774,7 +1774,51 @@ function resolvePendingNativeMVCPAdjust(ctx, newScroll) {
    }
    return false;
  }
@@ -58,11 +132,16 @@ index 9ebfddc183a9b202d35c990a387c9b628feeb185..c414a49e866ecab1393645101fb67d55
 +  if (!shouldHoldEndOnSizeChange(ctx, dataChanged)) {
 +    return restore;
 +  }
++  const { idsInView, indexByKey, positions } = ctx.state;
++  const anchorId = idsInView.find((id) => indexByKey.get(id) !== void 0);
++  const anchorIndex = anchorId === void 0 ? void 0 : indexByKey.get(anchorId);
++  const anchorPosition = anchorIndex === void 0 ? void 0 : positions[anchorIndex];
 +  return () => {
 +    if (!shouldHoldEndOnSizeChange(ctx, dataChanged)) {
 +      restore == null ? void 0 : restore();
 +      return;
 +    }
++    const scrollBefore = ctx.state.scroll;
 +    // Content that shrinks under an offset past its new end pulls the native offset back by itself.
 +    const endOffset = getScrollRangeEnd(ctx);
 +    if (ctx.state.scroll > endOffset) {
@@ -72,9 +151,114 @@ index 9ebfddc183a9b202d35c990a387c9b628feeb185..c414a49e866ecab1393645101fb67d55
 +    if (Math.abs(positionDiff) > MVCP_POSITION_EPSILON) {
 +      requestAdjust(ctx, positionDiff, adjustmentSource);
 +    }
++    // T3 patch: how far holding the end moved the top visible row on screen, for a caller that
++    // eases the jump. Reported only shortly after `sizeChangeKey` changes, so growth at the end
++    // while streaming still follows at once.
++    const onEndHoldShift = ctx.state.props.onEndHoldShift;
++    const newAnchorIndex = anchorId === void 0 ? void 0 : ctx.state.indexByKey.get(anchorId);
++    const newAnchorPosition = newAnchorIndex === void 0 ? void 0 : ctx.state.positions[newAnchorIndex];
++    const inReflow = ctx.state.endHoldReflowUntil !== void 0 && Date.now() < ctx.state.endHoldReflowUntil;
++    if (onEndHoldShift && inReflow && anchorPosition !== void 0 && newAnchorPosition !== void 0) {
++      const shift = newAnchorPosition - anchorPosition - (ctx.state.scroll - scrollBefore);
++      if (Math.abs(shift) > MVCP_POSITION_EPSILON) onEndHoldShift(shift);
++    }
 +  };
 +}
 +function prepareDefaultMVCP(ctx, dataChanged, adjustmentSource) {
    var _a3, _b, _c;
    const state = ctx.state;
    const { idsInView, positions, props } = state;
+@@ -8345,6 +8389,8 @@ var LegendListInner = typedForwardRef(function LegendListInner2(props, forwarded
+     ListHeaderComponent,
+     maintainScrollAtEnd = false,
+     maintainScrollAtEndThreshold = 0.1,
++    onEndHoldShift,
++    sizeChangeKey,
+     maintainVisibleContentPosition: maintainVisibleContentPositionProp,
+     numColumns: numColumnsProp = 1,
+     overrideItemLayout,
+@@ -8604,7 +8650,12 @@ var LegendListInner = typedForwardRef(function LegendListInner2(props, forwarded
+   const throttledOnScroll = useThrottledOnScroll(onScrollProp != null ? onScrollProp : noopOnScroll, scrollEventThrottle != null ? scrollEventThrottle : 0);
+   const throttleScrollFn = scrollEventThrottle && onScrollProp ? throttledOnScroll : onScrollProp;
+   const didAnchoredEndSpaceAnchorIndexChange = !isFirstLocal && !didDataChangeLocal && ((_r = state.props.anchoredEndSpace) == null ? void 0 : _r.anchorIndex) !== (anchoredEndSpace == null ? void 0 : anchoredEndSpace.anchorIndex);
++  if (state.props.sizeChangeKey !== void 0 && sizeChangeKey !== state.props.sizeChangeKey) {
++    state.endHoldReflowUntil = Date.now() + 500;
++  }
+   state.props = {
++    onEndHoldShift,
++    sizeChangeKey,
+     adaptiveRender: experimental_adaptiveRender,
+     alignItemsAtEnd,
+     alignItemsAtEndPaddingEnabled: useAlignItemsAtEndPadding,
+diff --git a/react-native.web.d.ts b/react-native.web.d.ts
+index 358fcd7faa598af8a4382719b7e7198b3ce04588..d36440a103ddee67b15e9c287781ce7720560900 100644
+--- a/react-native.web.d.ts
++++ b/react-native.web.d.ts
+@@ -309,6 +309,13 @@ interface LegendListSpecificProps<ItemT, TItemType extends string | undefined> {
+      * @default false
+      */
+     maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
++    /**
++     * T3 patch: called when a size change held the end and moved the top visible row on screen by
++     * `shift` points (down is positive). Native only.
++     */
++    onEndHoldShift?: (shift: number) => void;
++    /** T3 patch: a change marks a reflow, such as a new width, for `onEndHoldShift`. */
++    sizeChangeKey?: string | number;
+     /**
+      * Distance threshold in percentage of screen size to trigger maintainScrollAtEnd.
+      * @default 0.1
+diff --git a/react.d.ts b/react.d.ts
+index 358fcd7faa598af8a4382719b7e7198b3ce04588..d36440a103ddee67b15e9c287781ce7720560900 100644
+--- a/react.d.ts
++++ b/react.d.ts
+@@ -309,6 +309,13 @@ interface LegendListSpecificProps<ItemT, TItemType extends string | undefined> {
+      * @default false
+      */
+     maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
++    /**
++     * T3 patch: called when a size change held the end and moved the top visible row on screen by
++     * `shift` points (down is positive). Native only.
++     */
++    onEndHoldShift?: (shift: number) => void;
++    /** T3 patch: a change marks a reflow, such as a new width, for `onEndHoldShift`. */
++    sizeChangeKey?: string | number;
+     /**
+      * Distance threshold in percentage of screen size to trigger maintainScrollAtEnd.
+      * @default 0.1
+diff --git a/reanimated.d.ts b/reanimated.d.ts
+index 5b568f2d39783dd257e97e4727c45373cac41165..bc74fb4d3359deddc3b8bca929337734162c55f9 100644
+--- a/reanimated.d.ts
++++ b/reanimated.d.ts
+@@ -283,6 +283,13 @@ interface LegendListSpecificProps<ItemT, TItemType extends string | undefined> {
+      * @default false
+      */
+     maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
++    /**
++     * T3 patch: called when a size change held the end and moved the top visible row on screen by
++     * `shift` points (down is positive). Native only.
++     */
++    onEndHoldShift?: (shift: number) => void;
++    /** T3 patch: a change marks a reflow, such as a new width, for `onEndHoldShift`. */
++    sizeChangeKey?: string | number;
+     /**
+      * Distance threshold in percentage of screen size to trigger maintainScrollAtEnd.
+      * @default 0.1
+diff --git a/section-list.d.ts b/section-list.d.ts
+index 94edf333f0d0a140534421f3c72886eb8a48c130..8d96b82054163d73d2ed763c36a6baa2eb0880b0 100644
+--- a/section-list.d.ts
++++ b/section-list.d.ts
+@@ -339,6 +339,13 @@ interface LegendListSpecificProps<ItemT, TItemType extends string | undefined> {
+      * @default false
+      */
+     maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
++    /**
++     * T3 patch: called when a size change held the end and moved the top visible row on screen by
++     * `shift` points (down is positive). Native only.
++     */
++    onEndHoldShift?: (shift: number) => void;
++    /** T3 patch: a change marks a reflow, such as a new width, for `onEndHoldShift`. */
++    sizeChangeKey?: string | number;
+     /**
+      * Distance threshold in percentage of screen size to trigger maintainScrollAtEnd.
+      * @default 0.1
