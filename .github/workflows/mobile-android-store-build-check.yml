@@ -80,7 +80,6 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq ccache
           ccache --zero-stats
 
-      # eas build --local installs the workspace itself, so no repo install here.
       - name: Setup Node
         if: steps.record.outputs.built != 'true'
         uses: actions/setup-node@v6
@@ -93,6 +92,12 @@ jobs:
           npm install --global corepack@latest
           corepack enable
           pnpm --version
+
+      # EAS commands load app.config.ts, whose plugins must resolve. The build
+      # installs the workspace again in its own copy, so skip scripts here.
+      - name: Install mobile dependencies
+        if: steps.record.outputs.built != 'true'
+        run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --filter=@t3tools/mobile...
 
       - name: Setup Java
         if: steps.record.outputs.built != 'true'

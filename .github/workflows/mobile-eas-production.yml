@@ -437,8 +437,8 @@ jobs:
   android:
     name: Android store build
     needs: production
-    # Still build when an unrelated OTA in the production job failed.
-    if: ${{ !cancelled() && needs.production.outputs.android_build == 'true' }}
+    # Skipped when the production job failed: no store build after a failed OTA.
+    if: needs.production.outputs.android_build == 'true'
     runs-on: blacksmith-32vcpu-ubuntu-2404
     timeout-minutes: 60
     concurrency:
@@ -505,7 +505,6 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq ccache
           ccache --zero-stats
 
-      # eas build --local installs the workspace itself, so no repo install here.
       - name: Setup Node
         if: steps.record.outputs.built != 'true'
         uses: actions/setup-node@v6
@@ -518,6 +517,12 @@ jobs:
           npm install --global corepack@latest
           corepack enable
           pnpm --version
+
+      # EAS commands load app.config.ts, whose plugins must resolve. The build
+      # installs the workspace again in its own copy, so skip scripts here.
+      - name: Install mobile dependencies
+        if: steps.record.outputs.built != 'true'
+        run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --filter=@t3tools/mobile...
 
       - name: Setup Java
         if: steps.record.outputs.built != 'true'
