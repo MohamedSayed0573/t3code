@@ -1,0 +1,38 @@
+name: Mobile Tag Probe
+
+# TEMPORARY (drop before merge): which commits may GITHUB_TOKEN tag?
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mobile-tag-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.repository == 'pingdotgg/t3code'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Probe
+        run: |
+          git fetch -q origin main
+          wf_commit="$(git log -1 --format=%H origin/main -- .github/workflows)"
+          for case in "tip=$(git rev-parse origin/main)" "older-no-wf=$(git rev-parse origin/main~5)" "wf-commit=$wf_commit" "wf-parent=$(git rev-parse "$wf_commit~1")" "pr-head=${{ github.event.pull_request.head.sha }}"; do
+            name="${case%%=*}"; sha="${case#*=}"
+            tag="mobile-tag-probe/${{ github.run_id }}-$name"
+            git tag "$tag" "$sha"
+            for attempt in 1 2 3; do
+              if out="$(git push origin "refs/tags/$tag" 2>&1)"; then
+                echo "PROBE $name $sha attempt $attempt: OK"
+                git push -q origin --delete "refs/tags/$tag"
+                break
+              fi
+              echo "PROBE $name $sha attempt $attempt: FAIL $(grep -E 'rejected|fatal|refusing' <<<"$out" | head -2 | tr '\n' ' ')"
+            done
+          done
