@@ -632,7 +632,8 @@ jobs:
             echo "$BUILD_TAG already exists."
           else
             git tag "$BUILD_TAG" HEAD
-            git push origin "refs/tags/$BUILD_TAG"
+            # GitHub occasionally fails ref pushes server-side ("fatal error in commit_refs").
+            git push origin "refs/tags/$BUILD_TAG" || git push origin "refs/tags/$BUILD_TAG"
           fi
           echo ":rocket: android: submitted and recorded \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -761,6 +762,7 @@ jobs:
             echo "$BUILD_TAG already exists."
           else
             git tag "$BUILD_TAG" HEAD
-            git push origin "refs/tags/$BUILD_TAG"
+            # GitHub occasionally fails ref pushes server-side ("fatal error in commit_refs").
+            git push origin "refs/tags/$BUILD_TAG" || git push origin "refs/tags/$BUILD_TAG"
           fi
           echo ":rocket: ios: submitted and recorded \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"

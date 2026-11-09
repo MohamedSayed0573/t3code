@@ -156,14 +156,12 @@ jobs:
         working-directory: apps/mobile
         run: echo eas submit --platform android --profile production --path "$RUNNER_TEMP/t3code.aab" --non-interactive
 
-      # Production tags main commits; check GITHUB_TOKEN may tag those (the PR head is refused).
+      # Production tags main commits; check that GITHUB_TOKEN may (the PR head is refused).
       - name: Record build
         if: steps.record.outputs.built != 'true'
         run: |
           git fetch -q origin main
-          for sha in "$(git rev-parse origin/main)" "$(git log -1 --format=%H origin/main -- .github/workflows)"; do
-            tag="$BUILD_TAG-$sha"
-            git tag "$tag" "$sha"
-            git push origin "refs/tags/$tag"
-            git push origin --delete "refs/tags/$tag"
-          done
+          tag="$BUILD_TAG-$(git rev-parse origin/main)"
+          git tag "$tag" origin/main
+          git push origin "refs/tags/$tag" || git push origin "refs/tags/$tag"
+          git push origin --delete "refs/tags/$tag"
