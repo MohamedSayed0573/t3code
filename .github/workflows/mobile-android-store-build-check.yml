@@ -52,6 +52,8 @@ jobs:
             echo "GRADLE_USER_HOME=$cache/gradle"
             echo "CCACHE_DIR=$cache/ccache"
             echo "CCACHE_MAXSIZE=5G"
+            # Gradle installs the NDK fresh each run, so key on the compiler's version, not its mtime.
+            echo "CCACHE_COMPILERCHECK=%compiler% -v"
             echo "pnpm_config_store_dir=$cache/pnpm-store"
             # eas build --local copies the project here. A fixed path keeps
             # ccache keys stable, and the same disk as the store lets pnpm hardlink.
